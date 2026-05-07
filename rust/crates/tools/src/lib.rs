@@ -600,6 +600,318 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "ReproPreflight",
+            description: "Run reproduce preflight step (tool-first) using a recipe and shared state.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" },
+                    "output_root": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproRunOnce",
+            description: "Run reproduce execution step once (tool-first) using a recipe and shared state.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" },
+                    "output_root": { "type": "string" },
+                    "allow_run_on_preflight_failure": { "type": "boolean" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproRuntimePythonSelect",
+            description: "Select the best Python runtime for this run by probing candidate interpreters and locking a run-local venv.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproRuntimeEnvSelect",
+            description: "Select and lock a per-run runtime Python environment (venv) for subsequent fix/run tools.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproEnvFix",
+            description: "Run environment/dependency auto-fix step (no-shim-first) from latest reproduce failure.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproConstraintResolve",
+            description: "Resolve dependency version/API mismatches using repository constraint hints.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproSourceFix",
+            description: "Apply source-level recovery for missing in-repo modules/symbols via configured handlers.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" },
+                    "recovery_action": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproSourcePathFix",
+            description: "Apply source path alias recovery (for example src.* import-path compatibility shims).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproRuntimeTraceFix",
+            description: "Apply targeted runtime traceback fixes using known error signatures.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproRepoPathProbe",
+            description: "Probe original repository execution paths from a reproduce recipe using static scans, import checks, and external-service risk detection.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" },
+                    "output_root": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproBuildOriginalRunner",
+            description: "Generate a workspace-local original-code runner from repo path probe evidence and switch the isolated recipe entrypoint away from proxy harnesses.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproSimulationBackendFix",
+            description: "Patch an isolated reproduce workspace to replace remote QPU/IBM backend access with local simulation-only backends.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproDependencyRuntimeFix",
+            description: "Install missing runtime third-party dependencies from latest reproduce failure signals.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "python_executable": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproVerifyClaim",
+            description: "Run reproduce verification step (figure claim) using last run artifacts from shared state.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "output_root": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproClassifyFailure",
+            description: "Classify the latest reproduce failure and emit next_allowed_actions from state machine.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproApplyFix",
+            description: "Apply one configured reproduce recovery action against the latest attempt.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" },
+                    "recovery_action": { "type": "string" },
+                    "python_executable": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproFixValidate",
+            description: "Validate the latest applied fix and move state machine into fix-validation stage.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproTestPlan",
+            description: "Create a unit/regression test plan for the current reproduce run state.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": { "type": "string" },
+                    "state": { "type": "string" }
+                },
+                "required": ["recipe"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproRunUnitTests",
+            description: "Execute unit-test commands from the current reproduce test plan.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "state": { "type": "string" }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproRunRegressionTests",
+            description: "Execute regression-test commands from the current reproduce test plan.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "state": { "type": "string" }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ReproRenderArtifacts",
+            description: "Render final reproduce artifacts and summary from shared state.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "state": { "type": "string" }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "NotebookEdit",
             description: "Replace, insert, or delete a cell in a Jupyter notebook.",
             input_schema: json!({
@@ -1211,6 +1523,53 @@ fn execute_tool_with_enforcer(
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
+        "ReproPreflight" => from_value::<ReproPreflightInput>(input).and_then(run_repro_preflight),
+        "ReproRunOnce" => from_value::<ReproRunOnceInput>(input).and_then(run_repro_run_once),
+        "ReproRuntimePythonSelect" => {
+            from_value::<ReproRuntimePythonSelectInput>(input).and_then(run_repro_runtime_python_select)
+        },
+        "ReproRuntimeEnvSelect" => {
+            from_value::<ReproRuntimeEnvSelectInput>(input).and_then(run_repro_runtime_env_select)
+        },
+        "ReproEnvFix" => from_value::<ReproEnvFixInput>(input).and_then(run_repro_env_fix),
+        "ReproConstraintResolve" => {
+            from_value::<ReproConstraintResolveInput>(input).and_then(run_repro_constraint_resolve)
+        }
+        "ReproSourceFix" => from_value::<ReproSourceFixInput>(input).and_then(run_repro_source_fix),
+        "ReproSourcePathFix" => {
+            from_value::<ReproSourcePathFixInput>(input).and_then(run_repro_source_path_fix)
+        }
+        "ReproRuntimeTraceFix" => {
+            from_value::<ReproRuntimeTraceFixInput>(input).and_then(run_repro_runtime_trace_fix)
+        }
+        "ReproRepoPathProbe" => {
+            from_value::<ReproRepoPathProbeInput>(input).and_then(run_repro_repo_path_probe)
+        }
+        "ReproBuildOriginalRunner" => from_value::<ReproBuildOriginalRunnerInput>(input)
+            .and_then(run_repro_build_original_runner),
+        "ReproSimulationBackendFix" => from_value::<ReproSimulationBackendFixInput>(input)
+            .and_then(run_repro_simulation_backend_fix),
+        "ReproDependencyRuntimeFix" => from_value::<ReproDependencyRuntimeFixInput>(input)
+            .and_then(run_repro_dependency_runtime_fix),
+        "ReproVerifyClaim" => {
+            from_value::<ReproVerifyClaimInput>(input).and_then(run_repro_verify_claim)
+        }
+        "ReproClassifyFailure" => {
+            from_value::<ReproClassifyFailureInput>(input).and_then(run_repro_classify_failure)
+        }
+        "ReproApplyFix" => from_value::<ReproApplyFixInput>(input).and_then(run_repro_apply_fix),
+        "ReproFixValidate" => {
+            from_value::<ReproFixValidateInput>(input).and_then(run_repro_fix_validate)
+        }
+        "ReproTestPlan" => from_value::<ReproTestPlanInput>(input).and_then(run_repro_test_plan),
+        "ReproRunUnitTests" => {
+            from_value::<ReproRunUnitTestsInput>(input).and_then(run_repro_run_unit_tests)
+        }
+        "ReproRunRegressionTests" => from_value::<ReproRunRegressionTestsInput>(input)
+            .and_then(run_repro_run_regression_tests),
+        "ReproRenderArtifacts" => {
+            from_value::<ReproRenderArtifactsInput>(input).and_then(run_repro_render_artifacts)
+        }
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
@@ -2001,6 +2360,365 @@ fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
     to_pretty_json(execute_tool_search(input))
 }
 
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_preflight(input: ReproPreflightInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_preflight.py",
+        &input.recipe,
+        input.state.as_deref(),
+        input.output_root.as_deref(),
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_run_once(input: ReproRunOnceInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_run_once.py",
+        &input.recipe,
+        input.state.as_deref(),
+        input.output_root.as_deref(),
+        input.python_executable.as_deref(),
+        input.allow_run_on_preflight_failure.unwrap_or(false),
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_env_fix(input: ReproEnvFixInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_env_fix.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_runtime_env_select(input: ReproRuntimeEnvSelectInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_runtime_env_select.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_runtime_python_select(input: ReproRuntimePythonSelectInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_runtime_python_select.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_constraint_resolve(input: ReproConstraintResolveInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_constraint_resolve.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_source_fix(input: ReproSourceFixInput) -> Result<String, String> {
+    let mut extra_args: Vec<String> = Vec::new();
+    if let Some(action) = input.recovery_action.as_deref() {
+        extra_args.push("--recovery-action".to_string());
+        extra_args.push(action.to_string());
+    }
+    run_repro_tool_command(
+        "tool_source_fix.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &extra_args,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_source_path_fix(input: ReproSourcePathFixInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_source_path_fix.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_runtime_trace_fix(input: ReproRuntimeTraceFixInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_runtime_trace_fix.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_repo_path_probe(input: ReproRepoPathProbeInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_repo_path_probe.py",
+        &input.recipe,
+        input.state.as_deref(),
+        input.output_root.as_deref(),
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_build_original_runner(input: ReproBuildOriginalRunnerInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_build_original_runner.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_simulation_backend_fix(input: ReproSimulationBackendFixInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_simulation_backend_fix.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_dependency_runtime_fix(input: ReproDependencyRuntimeFixInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_dependency_runtime_fix.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_verify_claim(input: ReproVerifyClaimInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_verify_claim.py",
+        &input.recipe,
+        input.state.as_deref(),
+        input.output_root.as_deref(),
+        None,
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_classify_failure(input: ReproClassifyFailureInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_classify_failure.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        None,
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_apply_fix(input: ReproApplyFixInput) -> Result<String, String> {
+    let mut extra_args: Vec<String> = Vec::new();
+    if let Some(action) = input.recovery_action.as_deref() {
+        extra_args.push("--recovery-action".to_string());
+        extra_args.push(action.to_string());
+    }
+    run_repro_tool_command(
+        "tool_apply_fix.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        input.python_executable.as_deref(),
+        false,
+        &extra_args,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_fix_validate(input: ReproFixValidateInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_fix_validate.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        None,
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_test_plan(input: ReproTestPlanInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_test_plan.py",
+        &input.recipe,
+        input.state.as_deref(),
+        None,
+        None,
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_run_unit_tests(input: ReproRunUnitTestsInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_run_unit_tests.py",
+        "__state_only__",
+        input.state.as_deref(),
+        None,
+        None,
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_run_regression_tests(input: ReproRunRegressionTestsInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_run_regression_tests.py",
+        "__state_only__",
+        input.state.as_deref(),
+        None,
+        None,
+        false,
+        &[],
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_repro_render_artifacts(input: ReproRenderArtifactsInput) -> Result<String, String> {
+    run_repro_tool_command(
+        "tool_render_artifacts.py",
+        "__state_only__",
+        input.state.as_deref(),
+        None,
+        None,
+        false,
+        &[],
+    )
+}
+
+fn default_repro_state_path(cwd: &Path) -> PathBuf {
+    cwd.join("temp/agent_framework/reproduce/tools/state.json")
+}
+
+fn resolve_repro_tool_script(cwd: &Path, script_name: &str) -> Option<PathBuf> {
+    let relative = Path::new("evaluation/agent_framework/reproduce/tools").join(script_name);
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join(&relative);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn run_repro_tool_command(
+    script_name: &str,
+    recipe: &str,
+    state: Option<&str>,
+    output_root: Option<&str>,
+    python_executable: Option<&str>,
+    allow_run_on_preflight_failure: bool,
+    extra_args: &[String],
+) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let script_path = resolve_repro_tool_script(&cwd, script_name).ok_or_else(|| {
+        format!(
+            "reproduce tool script not found: evaluation/agent_framework/reproduce/tools/{script_name}"
+        )
+    })?;
+    let state_path = state
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_repro_state_path(&cwd));
+
+    let mut cmd = Command::new(python_executable.unwrap_or("python"));
+    cmd.arg(&script_path);
+    if recipe != "__state_only__" {
+        cmd.arg("--recipe").arg(recipe);
+    }
+    cmd.arg("--state").arg(&state_path);
+    if let Some(root) = output_root {
+        cmd.arg("--output-root").arg(root);
+    }
+    if let Some(pyexe) = python_executable {
+        cmd.arg("--python-executable").arg(pyexe);
+    }
+    if allow_run_on_preflight_failure {
+        cmd.arg("--allow-run-on-preflight-failure");
+    }
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd.current_dir(&cwd);
+
+    let output = cmd.output().map_err(|error| error.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let parsed_stdout: Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        json!({
+            "raw_stdout": stdout,
+        })
+    });
+
+    to_pretty_json(json!({
+        "tool_script": script_name,
+        "script_path": script_path,
+        "recipe": recipe,
+        "state_path": state_path,
+        "cwd": cwd,
+        "command_success": output.status.success(),
+        "exit_code": output.status.code(),
+        "stdout": parsed_stdout,
+        "stderr": stderr,
+    }))
+}
+
 fn run_notebook_edit(input: NotebookEditInput) -> Result<String, String> {
     to_pretty_json(execute_notebook_edit(input)?)
 }
@@ -2126,6 +2844,150 @@ struct AgentInput {
 struct ToolSearchInput {
     query: String,
     max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproPreflightInput {
+    recipe: String,
+    state: Option<String>,
+    output_root: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproRunOnceInput {
+    recipe: String,
+    state: Option<String>,
+    output_root: Option<String>,
+    python_executable: Option<String>,
+    allow_run_on_preflight_failure: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproEnvFixInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproRuntimeEnvSelectInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproRuntimePythonSelectInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproConstraintResolveInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproSourceFixInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+    recovery_action: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproSourcePathFixInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproRuntimeTraceFixInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproRepoPathProbeInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+    output_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproBuildOriginalRunnerInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproSimulationBackendFixInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproDependencyRuntimeFixInput {
+    recipe: String,
+    state: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproVerifyClaimInput {
+    recipe: String,
+    state: Option<String>,
+    output_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproClassifyFailureInput {
+    recipe: String,
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproApplyFixInput {
+    recipe: String,
+    state: Option<String>,
+    recovery_action: Option<String>,
+    python_executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproFixValidateInput {
+    recipe: String,
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproTestPlanInput {
+    recipe: String,
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproRunUnitTestsInput {
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproRunRegressionTestsInput {
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReproRenderArtifactsInput {
+    state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8496,6 +9358,185 @@ printf 'pwsh:%s' "$1"
             output["task_packet"]["acceptance_tests"][1],
             "cargo test --workspace"
         );
+    }
+
+    #[test]
+    fn mvp_tool_specs_include_reproduce_step_tools() {
+        let names = mvp_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name.to_string())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "ReproPreflight"));
+        assert!(names.iter().any(|name| name == "ReproRunOnce"));
+        assert!(names.iter().any(|name| name == "ReproSourcePathFix"));
+        assert!(names.iter().any(|name| name == "ReproRuntimeTraceFix"));
+        assert!(names.iter().any(|name| name == "ReproDependencyRuntimeFix"));
+        assert!(names.iter().any(|name| name == "ReproVerifyClaim"));
+        assert!(names.iter().any(|name| name == "ReproClassifyFailure"));
+        assert!(names.iter().any(|name| name == "ReproApplyFix"));
+        assert!(names.iter().any(|name| name == "ReproFixValidate"));
+        assert!(names.iter().any(|name| name == "ReproTestPlan"));
+        assert!(names.iter().any(|name| name == "ReproRunUnitTests"));
+        assert!(names.iter().any(|name| name == "ReproRunRegressionTests"));
+        assert!(names.iter().any(|name| name == "ReproRenderArtifacts"));
+    }
+
+    #[test]
+    fn execute_repro_preflight_tool_invokes_python_step() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let repo_root = cwd
+            .ancestors()
+            .find(|ancestor| {
+                ancestor
+                    .join("evaluation/agent_framework/reproduce/tools/tool_preflight.py")
+                    .is_file()
+            })
+            .expect("repo root with reproduce tools should exist")
+            .to_path_buf();
+        let recipe = repo_root
+            .join("evaluation/agent_framework/reproduce/examples/qos_import_smoke.json");
+        let state_path = temp_path("repro-tool-state.json");
+        let output_root = temp_path("repro-tool-output");
+
+        let result = execute_tool(
+            "ReproPreflight",
+            &json!({
+                "recipe": recipe.display().to_string(),
+                "state": state_path.display().to_string(),
+                "output_root": output_root.display().to_string()
+            }),
+        )
+        .expect("repro preflight tool should execute");
+
+        let payload: serde_json::Value = serde_json::from_str(&result).expect("json payload");
+        assert_eq!(payload["tool_script"], "tool_preflight.py");
+        assert!(payload.get("stdout").is_some());
+        assert!(payload.get("command_success").is_some());
+    }
+
+    #[test]
+    fn execute_repro_classify_and_apply_fix_chain_updates_budget() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let repo_root = cwd
+            .ancestors()
+            .find(|ancestor| {
+                ancestor
+                    .join("evaluation/agent_framework/reproduce/examples/qos_fix_budget_demo.json")
+                    .is_file()
+            })
+            .expect("repo root with demo recipe should exist")
+            .to_path_buf();
+        let recipe = repo_root
+            .join("evaluation/agent_framework/reproduce/examples/qos_fix_budget_demo.json");
+        let state_path = temp_path("repro-fix-chain-state.json");
+
+        let preflight_raw = execute_tool(
+            "ReproPreflight",
+            &json!({
+                "recipe": recipe.display().to_string(),
+                "state": state_path.display().to_string()
+            }),
+        )
+        .expect("preflight tool should execute");
+        let preflight: serde_json::Value =
+            serde_json::from_str(&preflight_raw).expect("preflight json");
+        assert_eq!(preflight["tool_script"], "tool_preflight.py");
+        assert_eq!(preflight["command_success"], false);
+
+        let classify_raw = execute_tool(
+            "ReproClassifyFailure",
+            &json!({
+                "recipe": recipe.display().to_string(),
+                "state": state_path.display().to_string()
+            }),
+        )
+        .expect("classify tool should execute");
+        let classify: serde_json::Value =
+            serde_json::from_str(&classify_raw).expect("classify json");
+        assert_eq!(classify["tool_script"], "tool_classify_failure.py");
+        assert_eq!(
+            classify["stdout"]["failure_category"].as_str(),
+            Some("missing_runtime_dependency")
+        );
+
+        let apply_raw = execute_tool(
+            "ReproApplyFix",
+            &json!({
+                "recipe": recipe.display().to_string(),
+                "state": state_path.display().to_string()
+            }),
+        )
+        .expect("apply-fix tool should execute");
+        let apply: serde_json::Value = serde_json::from_str(&apply_raw).expect("apply json");
+        assert_eq!(apply["tool_script"], "tool_apply_fix.py");
+        assert_eq!(apply["command_success"], true);
+        assert_eq!(apply["stdout"]["status"].as_str(), Some("success"));
+        assert_eq!(apply["stdout"]["fix_budget_before"].as_i64(), Some(2));
+        assert_eq!(apply["stdout"]["fix_budget_after"].as_i64(), Some(1));
+
+        let fix_validate_raw = execute_tool(
+            "ReproFixValidate",
+            &json!({
+                "recipe": recipe.display().to_string(),
+                "state": state_path.display().to_string()
+            }),
+        )
+        .expect("fix-validate tool should execute");
+        let fix_validate: serde_json::Value =
+            serde_json::from_str(&fix_validate_raw).expect("fix-validate json");
+        assert_eq!(fix_validate["tool_script"], "tool_fix_validate.py");
+        assert_eq!(fix_validate["command_success"], true);
+        assert_eq!(fix_validate["stdout"]["status"].as_str(), Some("success"));
+    }
+
+    #[test]
+    fn execute_repro_test_plan_and_unit_tests_tools() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let repo_root = cwd
+            .ancestors()
+            .find(|ancestor| {
+                ancestor
+                    .join("evaluation/agent_framework/reproduce/examples/qos_import_smoke.json")
+                    .is_file()
+            })
+            .expect("repo root with recipe should exist")
+            .to_path_buf();
+        let recipe = repo_root
+            .join("evaluation/agent_framework/reproduce/examples/qos_import_smoke.json");
+        let state_path = temp_path("repro-test-plan-state.json");
+
+        let _ = execute_tool(
+            "ReproPreflight",
+            &json!({
+                "recipe": recipe.display().to_string(),
+                "state": state_path.display().to_string()
+            }),
+        )
+        .expect("preflight tool should execute");
+
+        let plan_raw = execute_tool(
+            "ReproTestPlan",
+            &json!({
+                "recipe": recipe.display().to_string(),
+                "state": state_path.display().to_string()
+            }),
+        )
+        .expect("test-plan tool should execute");
+        let plan: serde_json::Value = serde_json::from_str(&plan_raw).expect("plan json");
+        assert_eq!(plan["tool_script"], "tool_test_plan.py");
+        assert_eq!(plan["command_success"], true);
+
+        let unit_raw = execute_tool(
+            "ReproRunUnitTests",
+            &json!({
+                "state": state_path.display().to_string()
+            }),
+        )
+        .expect("unit-test tool should execute");
+        let unit: serde_json::Value = serde_json::from_str(&unit_raw).expect("unit json");
+        assert_eq!(unit["tool_script"], "tool_run_unit_tests.py");
+        assert_eq!(unit["command_success"], true);
+        assert_eq!(unit["stdout"]["status"].as_str(), Some("success"));
     }
 
     struct TestServer {

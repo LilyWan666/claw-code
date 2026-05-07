@@ -26,9 +26,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
     AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    MessageResponse, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -249,6 +249,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Reproduce { args } => run_reproduce_command(args.as_deref())?,
         CliAction::Export {
             session_reference,
             output_path,
@@ -346,6 +347,9 @@ enum CliAction {
     },
     Init {
         output_format: CliOutputFormat,
+    },
+    Reproduce {
+        args: Option<String>,
     },
     Export {
         session_reference: String,
@@ -670,6 +674,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "login" => Ok(CliAction::Login { output_format }),
         "logout" => Ok(CliAction::Logout { output_format }),
         "init" => Ok(CliAction::Init { output_format }),
+        "reproduce" => Ok(CliAction::Reproduce {
+            args: join_optional_args(&rest[1..]),
+        }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -752,6 +759,7 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
+        "reproduce" => Some(Ok(CliAction::Reproduce { args: None })),
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -2616,6 +2624,2297 @@ fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+fn resolve_reproduce_runner_from(cwd: &Path, relative: &Path) -> Option<PathBuf> {
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join(relative);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn split_reproduce_args(args: Option<&str>) -> Vec<String> {
+    args.unwrap_or_default()
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct NativeReproduceConfig {
+    recipe: String,
+    state: Option<String>,
+    max_agent_steps: usize,
+    exit_policy: String,
+    python_executable: Option<String>,
+    output_root: Option<String>,
+    model: String,
+    api_base: String,
+    api_key: String,
+    allow_offline_agent: bool,
+}
+
+fn action_to_repro_tool(action: &str) -> Option<&'static str> {
+    match action {
+        "repro_preflight" => Some("ReproPreflight"),
+        "runtime_python_select" => Some("ReproRuntimePythonSelect"),
+        "repro_run_once" => Some("ReproRunOnce"),
+        "runtime_env_select" => Some("ReproRuntimeEnvSelect"),
+        "constraint_resolve" => Some("ReproConstraintResolve"),
+        "env_fix" => Some("ReproEnvFix"),
+        "repo_path_probe" => Some("ReproRepoPathProbe"),
+        "build_original_runner" => Some("ReproBuildOriginalRunner"),
+        "simulation_backend_fix" => Some("ReproSimulationBackendFix"),
+        "runtime_trace_fix" => Some("ReproRuntimeTraceFix"),
+        "source_path_fix" => Some("ReproSourcePathFix"),
+        "dependency_runtime_fix" => Some("ReproDependencyRuntimeFix"),
+        "source_fix" => Some("ReproSourceFix"),
+        "classify_failure" => Some("ReproClassifyFailure"),
+        "apply_fix" => Some("ReproApplyFix"),
+        "fix_validate" => Some("ReproFixValidate"),
+        "test_plan" => Some("ReproTestPlan"),
+        "run_unit_tests" => Some("ReproRunUnitTests"),
+        "run_regression_tests" => Some("ReproRunRegressionTests"),
+        "verify_claim" => Some("ReproVerifyClaim"),
+        "render_artifacts" => Some("ReproRenderArtifacts"),
+        _ => None,
+    }
+}
+
+fn native_choose_action(
+    fsm_state: Option<&str>,
+    last_status: Option<&str>,
+    last_failure_category: Option<&str>,
+    allowed_actions: &[String],
+) -> Option<String> {
+    if allowed_actions.is_empty() {
+        return None;
+    }
+    let preferred = match fsm_state.unwrap_or("INIT") {
+        "INIT" => vec!["repro_preflight"],
+        "PREFLIGHT" => vec!["repro_run_once", "test_plan", "classify_failure"],
+        "PREFLIGHT_FAILED" => {
+            if matches!(last_status, Some("runtime_env_selected")) {
+                vec![
+                    "classify_failure",
+                    "dependency_runtime_fix",
+                    "env_fix",
+                    "constraint_resolve",
+                    "test_plan",
+                ]
+            } else {
+                vec![
+                    "classify_failure",
+                    "runtime_python_select",
+                    "runtime_env_select",
+                    "env_fix",
+                    "constraint_resolve",
+                    "test_plan",
+                ]
+            }
+        }
+        "RUN_ONCE" => vec!["verify_claim", "test_plan", "classify_failure"],
+        "RUN_FAILED" => {
+            if matches!(
+                last_failure_category,
+                Some("original_code_path_not_exercised")
+            ) {
+                vec![
+                    "repo_path_probe",
+                    "build_original_runner",
+                    "classify_failure",
+                    "runtime_env_select",
+                    "simulation_backend_fix",
+                    "dependency_runtime_fix",
+                    "runtime_trace_fix",
+                    "source_path_fix",
+                    "source_fix",
+                    "test_plan",
+                ]
+            } else if matches!(
+                last_failure_category,
+                Some(
+                    "source_compat_missing_module_file"
+                        | "source_compat_missing_symbol_import"
+                        | "source_compat_missing_symbol_reference"
+                )
+            ) {
+                vec![
+                    "source_path_fix",
+                    "source_fix",
+                    "repo_path_probe",
+                    "classify_failure",
+                    "constraint_resolve",
+                    "env_fix",
+                    "runtime_env_select",
+                    "runtime_python_select",
+                    "test_plan",
+                ]
+            } else if matches!(last_status, Some("runtime_env_selected")) {
+                vec![
+                    "classify_failure",
+                    "repo_path_probe",
+                    "dependency_runtime_fix",
+                    "constraint_resolve",
+                    "env_fix",
+                    "test_plan",
+                ]
+            } else {
+                vec![
+                    "classify_failure",
+                    "repo_path_probe",
+                    "runtime_python_select",
+                    "runtime_env_select",
+                    "constraint_resolve",
+                    "env_fix",
+                    "test_plan",
+                ]
+            }
+        }
+        "CLASSIFY_FAILURE" => {
+            if matches!(last_status, Some("runtime_python_selected")) {
+                vec![
+                    "build_original_runner",
+                    "repo_path_probe",
+                    "runtime_env_select",
+                    "dependency_runtime_fix",
+                    "env_fix",
+                    "source_path_fix",
+                    "source_fix",
+                    "apply_fix",
+                    "terminal_failed",
+                ]
+            } else if matches!(last_status, Some("runtime_env_selected")) {
+                vec![
+                    "dependency_runtime_fix",
+                    "env_fix",
+                    "source_path_fix",
+                    "source_fix",
+                    "apply_fix",
+                    "terminal_failed",
+                ]
+            } else if matches!(
+                last_failure_category,
+                Some("original_code_path_not_exercised")
+            ) {
+                vec![
+                    "repo_path_probe",
+                    "runtime_env_select",
+                    "simulation_backend_fix",
+                    "dependency_runtime_fix",
+                    "runtime_trace_fix",
+                    "source_path_fix",
+                    "source_fix",
+                    "apply_fix",
+                    "terminal_failed",
+                ]
+            } else if matches!(last_failure_category, Some("missing_runtime_dependency")) {
+                vec![
+                    "dependency_runtime_fix",
+                    "repo_path_probe",
+                    "runtime_python_select",
+                    "runtime_env_select",
+                    "runtime_trace_fix",
+                    "source_path_fix",
+                    "source_fix",
+                    "apply_fix",
+                    "terminal_failed",
+                ]
+            } else if matches!(
+                last_failure_category,
+                Some("runtime_import_surface_mismatch")
+            ) {
+                vec![
+                    "simulation_backend_fix",
+                    "repo_path_probe",
+                    "runtime_trace_fix",
+                    "dependency_runtime_fix",
+                    "source_path_fix",
+                    "source_fix",
+                    "repo_path_probe",
+                    "apply_fix",
+                    "terminal_failed",
+                ]
+            } else if matches!(
+                last_failure_category,
+                Some(
+                    "source_compat_missing_module_file"
+                        | "source_compat_missing_symbol_import"
+                        | "source_compat_missing_symbol_reference"
+                )
+            ) {
+                vec![
+                    "source_path_fix",
+                    "source_fix",
+                    "apply_fix",
+                    "dependency_runtime_fix",
+                    "runtime_trace_fix",
+                    "runtime_env_select",
+                    "terminal_failed",
+                ]
+            } else if matches!(
+                last_status,
+                Some("source_path_fix_skipped" | "source_path_fix_failed" | "skipped")
+            ) {
+                vec![
+                    "runtime_env_select",
+                    "dependency_runtime_fix",
+                    "repo_path_probe",
+                    "runtime_trace_fix",
+                    "source_fix",
+                    "apply_fix",
+                    "terminal_failed",
+                ]
+            } else if matches!(
+                last_status,
+                Some("runtime_trace_fix_skipped" | "runtime_trace_fix_failed")
+            ) {
+                vec![
+                    "runtime_env_select",
+                    "dependency_runtime_fix",
+                    "repo_path_probe",
+                    "source_path_fix",
+                    "source_fix",
+                    "apply_fix",
+                    "terminal_failed",
+                ]
+            } else {
+                vec![
+                    "runtime_env_select",
+                    "repo_path_probe",
+                    "simulation_backend_fix",
+                    "runtime_trace_fix",
+                    "source_path_fix",
+                    "dependency_runtime_fix",
+                    "source_fix",
+                    "apply_fix",
+                    "terminal_failed",
+                ]
+            }
+        }
+        "APPLY_FIX" => vec!["repro_run_once", "fix_validate", "repro_preflight"],
+        "FIX_VALIDATE" => vec!["repro_run_once", "test_plan", "classify_failure"],
+        "TEST_PLAN" => vec!["repo_path_probe", "run_unit_tests", "run_regression_tests"],
+        "UNIT_TEST" => vec!["verify_claim", "classify_failure"],
+        "REGRESSION_TEST" => vec!["verify_claim", "classify_failure"],
+        "SUCCESS" => vec!["render_artifacts", "done"],
+        "ARTIFACTS_RENDERED" => vec!["done"],
+        "BUDGET_EXHAUSTED" => vec!["render_artifacts", "terminal_failed"],
+        "TERMINAL_FAILED" => vec!["render_artifacts", "done"],
+        _ => vec![],
+    };
+    for candidate in preferred {
+        if allowed_actions.iter().any(|action| action == candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    allowed_actions.first().cloned()
+}
+
+fn reproduce_allowed_actions_for_state(fsm_state: Option<&str>) -> Vec<String> {
+    let actions = match fsm_state.unwrap_or("INIT") {
+        "INIT" => vec!["repro_preflight", "terminal_failed"],
+        "PREFLIGHT" => vec![
+            "repro_run_once",
+            "test_plan",
+            "classify_failure",
+            "terminal_failed",
+        ],
+        "PREFLIGHT_FAILED" => vec![
+            "runtime_python_select",
+            "runtime_env_select",
+            "constraint_resolve",
+            "env_fix",
+            "classify_failure",
+            "test_plan",
+            "terminal_failed",
+        ],
+        "RUN_ONCE" => vec![
+            "verify_claim",
+            "test_plan",
+            "classify_failure",
+            "terminal_failed",
+        ],
+        "RUN_FAILED" => vec![
+            "repo_path_probe",
+            "build_original_runner",
+            "runtime_python_select",
+            "runtime_env_select",
+            "constraint_resolve",
+            "env_fix",
+            "classify_failure",
+            "test_plan",
+            "terminal_failed",
+        ],
+        "CLASSIFY_FAILURE" => vec![
+            "repo_path_probe",
+            "build_original_runner",
+            "runtime_python_select",
+            "runtime_env_select",
+            "simulation_backend_fix",
+            "runtime_trace_fix",
+            "source_path_fix",
+            "dependency_runtime_fix",
+            "source_fix",
+            "apply_fix",
+            "terminal_failed",
+            "escalate_human_review",
+        ],
+        "APPLY_FIX" => vec![
+            "build_original_runner",
+            "simulation_backend_fix",
+            "source_path_fix",
+            "source_fix",
+            "fix_validate",
+            "repro_preflight",
+            "repro_run_once",
+            "terminal_failed",
+        ],
+        "FIX_VALIDATE" => vec![
+            "repro_run_once",
+            "classify_failure",
+            "test_plan",
+            "terminal_failed",
+        ],
+        "TEST_PLAN" => vec![
+            "repo_path_probe",
+            "run_unit_tests",
+            "run_regression_tests",
+            "terminal_failed",
+        ],
+        "UNIT_TEST" => vec![
+            "verify_claim",
+            "classify_failure",
+            "rollback_last_fix",
+            "terminal_failed",
+        ],
+        "REGRESSION_TEST" => vec![
+            "verify_claim",
+            "classify_failure",
+            "rollback_last_fix",
+            "terminal_failed",
+        ],
+        "VERIFY_CLAIM" => vec!["success", "classify_failure", "terminal_failed"],
+        "SUCCESS" => vec!["render_artifacts", "done"],
+        "ARTIFACTS_RENDERED" => vec!["done"],
+        "BUDGET_EXHAUSTED" => vec!["render_artifacts", "terminal_failed", "done"],
+        "TERMINAL_FAILED" => vec!["render_artifacts", "done"],
+        _ => vec!["terminal_failed"],
+    };
+    actions.into_iter().map(ToOwned::to_owned).collect()
+}
+
+fn probe_recommended_actions_from_value(value: &Value) -> Vec<String> {
+    value
+        .get("summary")
+        .and_then(|summary| summary.get("recommended_next_actions"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn choose_probe_recommended_action(
+    recommended_actions: &[String],
+    allowed_actions: &[String],
+) -> Option<String> {
+    if recommended_actions.is_empty() {
+        return None;
+    }
+    // Prefer getting into a clean isolated runtime before installing missing packages.
+    for candidate in [
+        "runtime_env_select",
+        "build_original_runner",
+        "simulation_backend_fix",
+        "dependency_runtime_fix",
+        "runtime_trace_fix",
+        "source_path_fix",
+        "source_fix",
+        "env_fix",
+        "constraint_resolve",
+        "apply_fix",
+    ] {
+        if recommended_actions.iter().any(|action| action == candidate)
+            && allowed_actions.iter().any(|action| action == candidate)
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    recommended_actions
+        .iter()
+        .find(|action| allowed_actions.iter().any(|allowed| allowed == *action))
+        .cloned()
+}
+
+fn choose_fallback_action_with_runtime_python_priority(
+    fsm_state: Option<&str>,
+    last_status: Option<&str>,
+    last_failure_category: Option<&str>,
+    allowed_actions: &[String],
+    step_records: &[Value],
+    probe_recommended_actions: &[String],
+) -> String {
+    if matches!(
+        last_failure_category,
+        Some("original_code_path_not_exercised")
+    ) && matches!(last_status, Some("repo_path_probe_completed"))
+        && allowed_actions
+            .iter()
+            .any(|action| action == "build_original_runner")
+    {
+        return "build_original_runner".to_string();
+    }
+
+    if matches!(fsm_state, Some("CLASSIFY_FAILURE")) && !probe_recommended_actions.is_empty() {
+        let failed_action = match last_status {
+            Some("simulation_backend_fix_failed" | "simulation_backend_fix_skipped") => {
+                Some("simulation_backend_fix")
+            }
+            Some("dependency_runtime_fix_failed" | "dependency_runtime_fix_skipped") => {
+                Some("dependency_runtime_fix")
+            }
+            Some("runtime_trace_fix_failed" | "runtime_trace_fix_skipped") => {
+                Some("runtime_trace_fix")
+            }
+            Some("source_path_fix_failed" | "source_path_fix_skipped") => Some("source_path_fix"),
+            Some("source_fix_failed" | "source_fix_skipped") => Some("source_fix"),
+            _ => None,
+        };
+        let filtered_recommendations = probe_recommended_actions
+            .iter()
+            .filter(|action| {
+                if matches!(last_status, Some("runtime_env_selected"))
+                    && action.as_str() == "runtime_env_select"
+                {
+                    return false;
+                }
+                if failed_action == Some(action.as_str()) {
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(action) =
+            choose_probe_recommended_action(&filtered_recommendations, allowed_actions)
+        {
+            return action;
+        }
+    }
+
+    if matches!(
+        last_failure_category,
+        Some("original_code_path_not_exercised")
+    ) && allowed_actions
+        .iter()
+        .any(|action| action == "repo_path_probe")
+    {
+        return "repo_path_probe".to_string();
+    }
+
+    let mut fallback_action = native_choose_action(
+        fsm_state,
+        last_status,
+        last_failure_category,
+        allowed_actions,
+    )
+    .unwrap_or_else(|| "terminal_failed".to_string());
+    let runtime_python_already_selected = matches!(last_status, Some("runtime_python_selected"))
+        || step_records.iter().rev().any(|record| {
+            record.get("action").and_then(Value::as_str) == Some("runtime_python_select")
+                && record
+                    .get("stdout")
+                    .and_then(|stdout| stdout.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("success")
+        });
+    if !runtime_python_already_selected
+        && allowed_actions
+            .iter()
+            .any(|action| action == "runtime_python_select")
+    {
+        fallback_action = "runtime_python_select".to_string();
+    }
+    fallback_action
+}
+
+fn prefer_native_reproduce_decision(
+    fsm_state: Option<&str>,
+    last_failure_category: Option<&str>,
+    allowed_actions: &[String],
+    probe_recommended_actions: &[String],
+) -> bool {
+    if matches!(fsm_state, Some("CLASSIFY_FAILURE"))
+        && choose_probe_recommended_action(probe_recommended_actions, allowed_actions).is_some()
+    {
+        return true;
+    }
+    match fsm_state.unwrap_or("INIT") {
+        "INIT" => true,
+        "PREFLIGHT_FAILED" | "RUN_FAILED" => allowed_actions
+            .iter()
+            .any(|action| action == "classify_failure"),
+        "CLASSIFY_FAILURE" => {
+            last_failure_category.is_some()
+                && allowed_actions.iter().any(|action| {
+                    matches!(
+                        action.as_str(),
+                        "dependency_runtime_fix"
+                            | "source_path_fix"
+                            | "simulation_backend_fix"
+                            | "runtime_trace_fix"
+                    )
+                })
+        }
+        "APPLY_FIX" => allowed_actions
+            .iter()
+            .any(|action| action == "repro_run_once"),
+        "TEST_PLAN" => allowed_actions
+            .iter()
+            .any(|action| action == "repo_path_probe"),
+        _ => false,
+    }
+}
+
+fn normalize_repro_status_for_action(action: &str, raw_status: &str) -> String {
+    if raw_status != "success" {
+        return raw_status.to_string();
+    }
+    match action {
+        "runtime_python_select" => "runtime_python_selected".to_string(),
+        "runtime_env_select" => "runtime_env_selected".to_string(),
+        _ => raw_status.to_string(),
+    }
+}
+
+fn trailing_runtime_trace_fix_noop_count(step_records: &[Value]) -> usize {
+    step_records
+        .iter()
+        .rev()
+        .take_while(|record| {
+            let action = record.get("action").and_then(Value::as_str);
+            let status = record
+                .get("stdout")
+                .and_then(|stdout| stdout.get("status"))
+                .and_then(Value::as_str);
+            action == Some("runtime_trace_fix")
+                && matches!(
+                    status,
+                    Some("runtime_trace_fix_skipped" | "runtime_trace_fix_failed")
+                )
+        })
+        .count()
+}
+
+fn total_runtime_trace_fix_noop_count(step_records: &[Value]) -> usize {
+    step_records
+        .iter()
+        .filter(|record| {
+            let action = record.get("action").and_then(Value::as_str);
+            let status = record
+                .get("stdout")
+                .and_then(|stdout| stdout.get("status"))
+                .and_then(Value::as_str);
+            action == Some("runtime_trace_fix")
+                && matches!(
+                    status,
+                    Some("runtime_trace_fix_skipped" | "runtime_trace_fix_failed")
+                )
+        })
+        .count()
+}
+
+fn has_repo_style_missing_module(step_records: &[Value]) -> bool {
+    step_records.iter().rev().any(|record| {
+        let missing_from_list = record
+            .get("stdout")
+            .and_then(|stdout| stdout.get("missing_modules"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.iter().any(|item| {
+                    let module = item.as_str().unwrap_or_default();
+                    module.starts_with("qos.") || module.starts_with("qvm.")
+                })
+            })
+            .unwrap_or(false);
+        if missing_from_list {
+            return true;
+        }
+
+        let category = record
+            .get("stdout")
+            .and_then(|stdout| stdout.get("diagnosis"))
+            .and_then(|d| d.get("classification"))
+            .and_then(|c| c.get("category"))
+            .and_then(Value::as_str);
+        let source_compat = matches!(
+            category,
+            Some(
+                "source_compat_missing_module_file"
+                    | "source_compat_missing_symbol_import"
+                    | "source_compat_missing_symbol_reference"
+            )
+        );
+
+        record
+            .get("stdout")
+            .and_then(|stdout| stdout.get("diagnosis"))
+            .and_then(|d| d.get("classification"))
+            .and_then(|c| c.get("evidence"))
+            .and_then(Value::as_array)
+            .map(|evidence| {
+                evidence.iter().any(|item| {
+                    let module = item
+                        .get("missing_module")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let has_module_candidates = item
+                        .get("module_candidates")
+                        .and_then(Value::as_array)
+                        .map(|items| !items.is_empty())
+                        .unwrap_or(false);
+                    module.starts_with("qos.")
+                        || module.starts_with("qvm.")
+                        || (source_compat && has_module_candidates)
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn latest_run_failure_has_repo_style_missing_module(step_records: &[Value]) -> bool {
+    let Some(record) = step_records.iter().rev().find(|record| {
+        record.get("action").and_then(Value::as_str) == Some("repro_run_once")
+            && record
+                .get("stdout")
+                .and_then(|stdout| stdout.get("status"))
+                .and_then(Value::as_str)
+                == Some("run_failed")
+    }) else {
+        return false;
+    };
+
+    let missing_from_list = record
+        .get("stdout")
+        .and_then(|stdout| stdout.get("missing_modules"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().any(|item| {
+                let module = item.as_str().unwrap_or_default();
+                module.starts_with("qos.") || module.starts_with("qvm.")
+            })
+        })
+        .unwrap_or(false);
+    if missing_from_list {
+        return true;
+    }
+
+    let category = record
+        .get("stdout")
+        .and_then(|stdout| stdout.get("diagnosis"))
+        .and_then(|d| d.get("classification"))
+        .and_then(|c| c.get("category"))
+        .and_then(Value::as_str);
+    let source_compat = matches!(
+        category,
+        Some(
+            "source_compat_missing_module_file"
+                | "source_compat_missing_symbol_import"
+                | "source_compat_missing_symbol_reference"
+        )
+    );
+
+    record
+        .get("stdout")
+        .and_then(|stdout| stdout.get("diagnosis"))
+        .and_then(|d| d.get("classification"))
+        .and_then(|c| c.get("evidence"))
+        .and_then(Value::as_array)
+        .map(|evidence| {
+            evidence.iter().any(|item| {
+                let module = item
+                    .get("missing_module")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let has_module_candidates = item
+                    .get("module_candidates")
+                    .and_then(Value::as_array)
+                    .map(|items| !items.is_empty())
+                    .unwrap_or(false);
+                module.starts_with("qos.")
+                    || module.starts_with("qvm.")
+                    || (source_compat && has_module_candidates)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn has_recent_repo_style_run_failed(step_records: &[Value]) -> bool {
+    let mut latest_run_failed_index: Option<usize> = None;
+    for (idx, record) in step_records.iter().enumerate().rev() {
+        if record.get("action").and_then(Value::as_str) != Some("repro_run_once") {
+            continue;
+        }
+        let status = record
+            .get("stdout")
+            .and_then(|stdout| stdout.get("status"))
+            .and_then(Value::as_str);
+        if status != Some("run_failed") {
+            continue;
+        }
+        let category = record
+            .get("stdout")
+            .and_then(|stdout| stdout.get("diagnosis"))
+            .and_then(|d| d.get("classification"))
+            .and_then(|c| c.get("category"))
+            .and_then(Value::as_str);
+        if !matches!(
+            category,
+            Some(
+                "source_compat_missing_module_file"
+                    | "source_compat_missing_symbol_import"
+                    | "source_compat_missing_symbol_reference"
+            )
+        ) {
+            return false;
+        }
+        let evidence = record
+            .get("stdout")
+            .and_then(|stdout| stdout.get("diagnosis"))
+            .and_then(|d| d.get("classification"))
+            .and_then(|c| c.get("evidence"))
+            .and_then(Value::as_array);
+        let repo_style = evidence.map_or(false, |items| {
+            items.iter().any(|item| {
+                let module = item
+                    .get("missing_module")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let has_module_candidates = item
+                    .get("module_candidates")
+                    .and_then(Value::as_array)
+                    .map(|items| !items.is_empty())
+                    .unwrap_or(false);
+                module.starts_with("qos.") || module.starts_with("qvm.") || has_module_candidates
+            })
+        });
+        if !repo_style {
+            return false;
+        }
+        latest_run_failed_index = Some(idx);
+        break;
+    }
+
+    let Some(run_failed_idx) = latest_run_failed_index else {
+        return false;
+    };
+
+    // Once a source_path_fix has succeeded after that run_failed, stop forcing
+    // source_path_fix and allow validation (repro_run_once) to proceed.
+    for record in step_records.iter().skip(run_failed_idx + 1) {
+        if record.get("action").and_then(Value::as_str) != Some("source_path_fix") {
+            continue;
+        }
+        let status = record
+            .get("stdout")
+            .and_then(|stdout| stdout.get("status"))
+            .and_then(Value::as_str);
+        if status == Some("success") {
+            return false;
+        }
+    }
+    true
+}
+
+fn latest_run_failure_category(step_records: &[Value]) -> Option<&str> {
+    step_records.iter().rev().find_map(|record| {
+        if record.get("action").and_then(Value::as_str) != Some("repro_run_once") {
+            return None;
+        }
+        let status = record
+            .get("stdout")
+            .and_then(|stdout| stdout.get("status"))
+            .and_then(Value::as_str);
+        if status != Some("run_failed") {
+            return None;
+        }
+        record
+            .get("stdout")
+            .and_then(|stdout| stdout.get("diagnosis"))
+            .and_then(|d| d.get("classification"))
+            .and_then(|c| c.get("category"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn latest_run_failure_evidence_text(step_records: &[Value]) -> String {
+    step_records
+        .iter()
+        .rev()
+        .find_map(|record| {
+            if record.get("action").and_then(Value::as_str) != Some("repro_run_once") {
+                return None;
+            }
+            let status = record
+                .get("stdout")
+                .and_then(|stdout| stdout.get("status"))
+                .and_then(Value::as_str);
+            if status != Some("run_failed") {
+                return None;
+            }
+            record
+                .get("stdout")
+                .and_then(|stdout| stdout.get("diagnosis"))
+                .and_then(|d| d.get("classification"))
+                .and_then(|c| c.get("evidence"))
+                .map(Value::to_string)
+        })
+        .unwrap_or_default()
+}
+
+fn latest_failure_touches_remote_qpu_surface(step_records: &[Value]) -> bool {
+    let category = latest_run_failure_category(step_records).unwrap_or_default();
+    let evidence_text = latest_run_failure_evidence_text(step_records);
+    category == "runtime_import_surface_mismatch"
+        && (evidence_text.contains("qiskit_ibm_runtime")
+            || evidence_text.contains("IBMProvider")
+            || evidence_text.contains("IBMQ")
+            || evidence_text.contains("ibm_token")
+            || evidence_text.contains("get_backend"))
+}
+
+fn enforce_repro_action_guardrails(
+    requested_action: String,
+    fsm_state: Option<&str>,
+    last_status: Option<&str>,
+    allowed_actions: &[String],
+    step_records: &[Value],
+) -> (String, Option<String>) {
+    if matches!(last_status, Some("source_path_fix_applied"))
+        && allowed_actions
+            .iter()
+            .any(|allowed| allowed == "repro_run_once")
+        && requested_action != "repro_run_once"
+    {
+        return (
+            "repro_run_once".to_string(),
+            Some("guardrail_force_run_once_after_source_path_fix_applied".to_string()),
+        );
+    }
+
+    if latest_failure_touches_remote_qpu_surface(step_records)
+        && allowed_actions
+            .iter()
+            .any(|allowed| allowed == "simulation_backend_fix")
+        && requested_action != "simulation_backend_fix"
+    {
+        return (
+            "simulation_backend_fix".to_string(),
+            Some("guardrail_route_remote_qpu_surface_to_simulation_backend_fix".to_string()),
+        );
+    }
+
+    if requested_action == "source_path_fix" {
+        let last_source_path_fix = step_records
+            .iter()
+            .rev()
+            .find(|record| record.get("action").and_then(Value::as_str) == Some("source_path_fix"));
+        if let Some(last_fix) = last_source_path_fix {
+            let status = last_fix
+                .get("stdout")
+                .and_then(|stdout| stdout.get("status"))
+                .and_then(Value::as_str);
+            if status == Some("success")
+                && allowed_actions
+                    .iter()
+                    .any(|allowed| allowed == "repro_run_once")
+            {
+                return (
+                    "repro_run_once".to_string(),
+                    Some("guardrail_run_once_after_source_path_fix_success".to_string()),
+                );
+            }
+            let edits_empty = last_fix
+                .get("stdout")
+                .and_then(|stdout| stdout.get("edits"))
+                .and_then(Value::as_array)
+                .map(|items| items.is_empty())
+                .unwrap_or(false);
+            let validate_ok = last_fix
+                .get("stdout")
+                .and_then(|stdout| stdout.get("validate"))
+                .and_then(|v| v.get("ok"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            if status == Some("failed") && edits_empty && validate_ok {
+                if allowed_actions
+                    .iter()
+                    .any(|allowed| allowed == "repro_run_once")
+                {
+                    return (
+                        "repro_run_once".to_string(),
+                        Some("guardrail_run_once_after_source_path_fix_noop".to_string()),
+                    );
+                }
+                if allowed_actions
+                    .iter()
+                    .any(|allowed| allowed == "source_fix")
+                {
+                    return (
+                        "source_fix".to_string(),
+                        Some("guardrail_source_fix_after_source_path_fix_noop".to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    if has_recent_repo_style_run_failed(step_records)
+        && allowed_actions
+            .iter()
+            .any(|allowed| allowed == "source_path_fix")
+        && requested_action != "source_path_fix"
+        && requested_action != "source_fix"
+    {
+        return (
+            "source_path_fix".to_string(),
+            Some("guardrail_force_source_path_fix_for_repo_missing_module".to_string()),
+        );
+    }
+
+    if requested_action == "repro_run_once" {
+        let source_compat_failure = step_records.iter().rev().any(|record| {
+            let category = record
+                .get("stdout")
+                .and_then(|stdout| stdout.get("diagnosis"))
+                .and_then(|d| d.get("classification"))
+                .and_then(|c| c.get("category"))
+                .and_then(Value::as_str);
+            matches!(
+                category,
+                Some(
+                    "source_compat_missing_module_file"
+                        | "source_compat_missing_symbol_import"
+                        | "source_compat_missing_symbol_reference"
+                )
+            )
+        });
+        let already_applied_source_path_fix =
+            matches!(last_status, Some("source_path_fix_applied"))
+                || step_records.iter().rev().any(|record| {
+                    record.get("action").and_then(Value::as_str) == Some("source_path_fix")
+                        && record
+                            .get("stdout")
+                            .and_then(|stdout| stdout.get("status"))
+                            .and_then(Value::as_str)
+                            == Some("success")
+                });
+        if source_compat_failure
+            && !already_applied_source_path_fix
+            && allowed_actions.iter().any(|a| a == "source_path_fix")
+        {
+            return (
+                "source_path_fix".to_string(),
+                Some("guardrail_force_source_path_fix_before_run_once".to_string()),
+            );
+        }
+    }
+
+    if requested_action == "runtime_python_select" {
+        let already_selected = matches!(last_status, Some("runtime_python_selected"))
+            || step_records.iter().rev().any(|record| {
+                record.get("action").and_then(Value::as_str) == Some("runtime_python_select")
+                    && record
+                        .get("stdout")
+                        .and_then(|stdout| stdout.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("success")
+            });
+        if already_selected {
+            if latest_run_failure_category(step_records) == Some("missing_runtime_dependency")
+                && allowed_actions
+                    .iter()
+                    .any(|allowed| allowed == "dependency_runtime_fix")
+            {
+                return (
+                    "dependency_runtime_fix".to_string(),
+                    Some(
+                        "guardrail_dependency_fix_missing_runtime_dependency_after_python_selected"
+                            .to_string(),
+                    ),
+                );
+            }
+            if latest_run_failure_category(step_records) == Some("missing_runtime_dependency")
+                && allowed_actions
+                    .iter()
+                    .any(|allowed| allowed == "classify_failure")
+            {
+                return (
+                    "classify_failure".to_string(),
+                    Some(
+                        "guardrail_classify_missing_runtime_dependency_after_python_selected"
+                            .to_string(),
+                    ),
+                );
+            }
+            let env_already_selected = matches!(last_status, Some("runtime_env_selected"))
+                || step_records.iter().rev().any(|record| {
+                    record.get("action").and_then(Value::as_str) == Some("runtime_env_select")
+                        && record
+                            .get("stdout")
+                            .and_then(|stdout| stdout.get("status"))
+                            .and_then(Value::as_str)
+                            == Some("success")
+                });
+            if env_already_selected
+                && allowed_actions
+                    .iter()
+                    .any(|allowed| allowed == "dependency_runtime_fix")
+            {
+                return (
+                    "dependency_runtime_fix".to_string(),
+                    Some("guardrail_dependency_fix_after_python_and_env_selected".to_string()),
+                );
+            }
+            for candidate in [
+                "dependency_runtime_fix",
+                "runtime_env_select",
+                "env_fix",
+                "runtime_trace_fix",
+                "source_path_fix",
+                "source_fix",
+                "apply_fix",
+            ] {
+                if allowed_actions.iter().any(|allowed| allowed == candidate) {
+                    return (
+                        candidate.to_string(),
+                        Some("guardrail_reroute_from_runtime_python_select".to_string()),
+                    );
+                }
+            }
+        }
+        return (requested_action, None);
+    }
+
+    if requested_action == "runtime_env_select" {
+        if latest_run_failure_has_repo_style_missing_module(step_records)
+            && allowed_actions
+                .iter()
+                .any(|allowed| allowed == "source_path_fix")
+        {
+            return (
+                "source_path_fix".to_string(),
+                Some(
+                    "guardrail_reroute_runtime_env_select_to_source_path_fix_for_repo_module"
+                        .to_string(),
+                ),
+            );
+        }
+        let already_selected = matches!(last_status, Some("runtime_env_selected"))
+            || step_records.iter().rev().any(|record| {
+                record.get("action").and_then(Value::as_str) == Some("runtime_env_select")
+                    && record
+                        .get("stdout")
+                        .and_then(|stdout| stdout.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("success")
+            });
+        if already_selected {
+            if latest_run_failure_category(step_records) == Some("missing_runtime_dependency")
+                && allowed_actions
+                    .iter()
+                    .any(|allowed| allowed == "dependency_runtime_fix")
+            {
+                return (
+                    "dependency_runtime_fix".to_string(),
+                    Some(
+                        "guardrail_dependency_fix_missing_runtime_dependency_after_env_selected"
+                            .to_string(),
+                    ),
+                );
+            }
+            if latest_run_failure_category(step_records) == Some("missing_runtime_dependency")
+                && allowed_actions
+                    .iter()
+                    .any(|allowed| allowed == "classify_failure")
+            {
+                return (
+                    "classify_failure".to_string(),
+                    Some(
+                        "guardrail_classify_missing_runtime_dependency_after_env_selected"
+                            .to_string(),
+                    ),
+                );
+            }
+            let dependency_path_unhealthy = step_records.iter().rev().any(|record| {
+                if record.get("action").and_then(Value::as_str) != Some("dependency_runtime_fix") {
+                    return false;
+                }
+                let blocked = record
+                    .get("stdout")
+                    .and_then(|stdout| stdout.get("blocked_repeated_modules"))
+                    .and_then(Value::as_array)
+                    .map(|items| !items.is_empty())
+                    .unwrap_or(false);
+                let profile_failed = record
+                    .get("stdout")
+                    .and_then(|stdout| stdout.get("runtime_profile"))
+                    .and_then(|profile| profile.get("result"))
+                    .and_then(|result| result.get("ok"))
+                    .and_then(Value::as_bool)
+                    == Some(false);
+                blocked || profile_failed
+            });
+            let source_compat_failure = step_records.iter().rev().any(|record| {
+                let category = record
+                    .get("stdout")
+                    .and_then(|stdout| stdout.get("diagnosis"))
+                    .and_then(|d| d.get("classification"))
+                    .and_then(|c| c.get("category"))
+                    .and_then(Value::as_str);
+                matches!(
+                    category,
+                    Some(
+                        "source_compat_missing_module_file"
+                            | "source_compat_missing_symbol_import"
+                            | "source_compat_missing_symbol_reference"
+                    )
+                )
+            });
+
+            let candidates = if source_compat_failure {
+                vec![
+                    "source_path_fix",
+                    "source_fix",
+                    "apply_fix",
+                    "runtime_trace_fix",
+                    "dependency_runtime_fix",
+                    "terminal_failed",
+                ]
+            } else if dependency_path_unhealthy {
+                vec![
+                    "env_fix",
+                    "runtime_trace_fix",
+                    "source_path_fix",
+                    "source_fix",
+                    "apply_fix",
+                    "terminal_failed",
+                ]
+            } else {
+                vec![
+                    "dependency_runtime_fix",
+                    "env_fix",
+                    "runtime_trace_fix",
+                    "source_path_fix",
+                    "source_fix",
+                    "apply_fix",
+                ]
+            };
+            for candidate in candidates {
+                if allowed_actions.iter().any(|allowed| allowed == candidate) {
+                    return (
+                        candidate.to_string(),
+                        Some(format!(
+                            "guardrail_reroute_from_runtime_env_select last_status={} dependency_path_unhealthy={}",
+                            last_status.unwrap_or("unknown"),
+                            dependency_path_unhealthy
+                        )),
+                    );
+                }
+            }
+        }
+        return (requested_action, None);
+    }
+
+    if requested_action == "dependency_runtime_fix" {
+        if latest_run_failure_has_repo_style_missing_module(step_records)
+            && allowed_actions
+                .iter()
+                .any(|allowed| allowed == "source_path_fix")
+        {
+            return (
+                "source_path_fix".to_string(),
+                Some(
+                    "guardrail_reroute_dependency_runtime_fix_to_source_path_fix_for_repo_module"
+                        .to_string(),
+                ),
+            );
+        }
+        let already_blocked = step_records.iter().rev().any(|record| {
+            if record.get("action").and_then(Value::as_str) != Some("dependency_runtime_fix") {
+                return false;
+            }
+            record
+                .get("stdout")
+                .and_then(|stdout| stdout.get("blocked_repeated_modules"))
+                .and_then(Value::as_array)
+                .map(|items| !items.is_empty())
+                .unwrap_or(false)
+        });
+        let profile_failed = step_records.iter().rev().any(|record| {
+            if record.get("action").and_then(Value::as_str) != Some("dependency_runtime_fix") {
+                return false;
+            }
+            record
+                .get("stdout")
+                .and_then(|stdout| stdout.get("runtime_profile"))
+                .and_then(|profile| profile.get("result"))
+                .and_then(|result| result.get("ok"))
+                .and_then(Value::as_bool)
+                == Some(false)
+        });
+        if already_blocked || profile_failed {
+            for candidate in [
+                "runtime_trace_fix",
+                "source_path_fix",
+                "source_fix",
+                "apply_fix",
+                "terminal_failed",
+            ] {
+                if allowed_actions.iter().any(|allowed| allowed == candidate) {
+                    return (
+                        candidate.to_string(),
+                        Some(
+                            "guardrail_reroute_from_dependency_runtime_fix_after_blocked_or_profile_fail"
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+        }
+        return (requested_action, None);
+    }
+
+    if requested_action != "runtime_trace_fix" {
+        return (requested_action, None);
+    }
+    if !matches!(fsm_state, Some("CLASSIFY_FAILURE")) {
+        return (requested_action, None);
+    }
+
+    let trailing_noop = trailing_runtime_trace_fix_noop_count(step_records);
+    let total_noop = total_runtime_trace_fix_noop_count(step_records);
+    let should_reroute = matches!(
+        last_status,
+        Some("runtime_trace_fix_skipped" | "runtime_trace_fix_failed")
+    ) || trailing_noop >= 1
+        || total_noop >= 1;
+    if !should_reroute {
+        return (requested_action, None);
+    }
+
+    for candidate in [
+        "dependency_runtime_fix",
+        "source_path_fix",
+        "source_fix",
+        "apply_fix",
+    ] {
+        if allowed_actions.iter().any(|allowed| allowed == candidate) {
+            return (
+                candidate.to_string(),
+                Some(format!(
+                    "guardrail_reroute_from_runtime_trace_fix trailing_noop_count={trailing_noop} total_noop_count={total_noop} last_status={}",
+                    last_status.unwrap_or("unknown")
+                )),
+            );
+        }
+    }
+    (requested_action, None)
+}
+
+fn parse_native_reproduce_config(
+    runner_args: &[String],
+    default_recipe: &Path,
+) -> Result<NativeReproduceConfig, String> {
+    let mut recipe = default_recipe.display().to_string();
+    let mut state: Option<String> = None;
+    let mut max_agent_steps: usize = 8;
+    let mut exit_policy = "strict".to_string();
+    let mut python_executable: Option<String> = None;
+    let mut output_root: Option<String> = None;
+    let mut model =
+        std::env::var("REPRO_AGENT_MODEL").unwrap_or_else(|_| "Qwen2.5-14B-Instruct".to_string());
+    let mut api_base = std::env::var("REPRO_AGENT_API_BASE")
+        .unwrap_or_else(|_| "http://localhost:8000/v1".to_string());
+    let mut api_key = std::env::var("REPRO_AGENT_API_KEY").unwrap_or_else(|_| "EMPTY".to_string());
+    let mut allow_offline_agent = false;
+
+    let mut i = 0usize;
+    while i < runner_args.len() {
+        let arg = &runner_args[i];
+        let mut take_value = |name: &str| -> Result<String, String> {
+            i += 1;
+            if i >= runner_args.len() {
+                return Err(format!("missing value for {name}"));
+            }
+            Ok(runner_args[i].clone())
+        };
+        match arg.as_str() {
+            "--recipe" => recipe = take_value("--recipe")?,
+            "--state" => state = Some(take_value("--state")?),
+            "--max-agent-steps" => {
+                let raw = take_value("--max-agent-steps")?;
+                max_agent_steps = raw.parse::<usize>().map_err(|_| {
+                    format!("invalid --max-agent-steps value: {raw} (expected positive integer)")
+                })?;
+                if max_agent_steps == 0 {
+                    return Err("--max-agent-steps must be >= 1".to_string());
+                }
+            }
+            "--exit-policy" => {
+                let raw = take_value("--exit-policy")?;
+                if raw != "strict" && raw != "lenient" {
+                    return Err(format!("invalid --exit-policy: {raw} (use strict|lenient)"));
+                }
+                exit_policy = raw;
+            }
+            "--python-executable" => python_executable = Some(take_value("--python-executable")?),
+            "--output-root" => output_root = Some(take_value("--output-root")?),
+            "--model" => model = take_value("--model")?,
+            "--api-base" => api_base = take_value("--api-base")?,
+            "--api-key" => api_key = take_value("--api-key")?,
+            "--allow-offline-agent" => allow_offline_agent = true,
+            // Legacy python-runner arguments: accepted for migration compatibility,
+            // but intentionally ignored in the native tool-loop path.
+            "--allow-run-on-preflight-failure" => {}
+            "--disable-rule-fallback" => {}
+            "--disable-builtin-recovery" => {}
+            "--strict-agent-tooling" => {}
+            "--isolation-mode" => {
+                let _ = take_value("--isolation-mode")?;
+            }
+            "--baseline-ref" => {
+                let _ = take_value("--baseline-ref")?;
+            }
+            "--source-repo-root" => {
+                let _ = take_value("--source-repo-root")?;
+            }
+            "--tool-loop" => {}
+            unknown => {
+                return Err(format!(
+                    "unsupported --tool-loop runner argument: {unknown}. \
+allowed: --recipe --state --max-agent-steps --exit-policy --python-executable --output-root --model --api-base --api-key --allow-offline-agent \
+legacy-compatible (ignored): --allow-run-on-preflight-failure --disable-rule-fallback --disable-builtin-recovery --strict-agent-tooling --isolation-mode --baseline-ref --source-repo-root"
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    Ok(NativeReproduceConfig {
+        recipe,
+        state,
+        max_agent_steps,
+        exit_policy,
+        python_executable,
+        output_root,
+        model,
+        api_base,
+        api_key,
+        allow_offline_agent,
+    })
+}
+
+#[cfg(test)]
+mod reproduce_guardrail_tests {
+    use super::enforce_repro_action_guardrails;
+    use serde_json::json;
+    use serde_json::Value;
+
+    #[test]
+    fn forces_run_once_after_source_path_fix_applied() {
+        let requested = "repro_preflight".to_string();
+        let allowed = vec![
+            "source_path_fix".to_string(),
+            "repro_run_once".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let records: Vec<Value> = Vec::new();
+        let (action, note) = enforce_repro_action_guardrails(
+            requested,
+            Some("APPLY_FIX"),
+            Some("source_path_fix_applied"),
+            &allowed,
+            &records,
+        );
+        assert_eq!(action, "repro_run_once");
+        assert_eq!(
+            note.as_deref(),
+            Some("guardrail_force_run_once_after_source_path_fix_applied")
+        );
+    }
+
+    #[test]
+    fn reroutes_repeated_env_select_to_classify_for_missing_runtime_dependency() {
+        let requested = "runtime_env_select".to_string();
+        let allowed = vec![
+            "runtime_python_select".to_string(),
+            "runtime_env_select".to_string(),
+            "classify_failure".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let records = vec![
+            json!({
+                "action": "runtime_env_select",
+                "stdout": {"status": "success"}
+            }),
+            json!({
+                "action": "repro_run_once",
+                "stdout": {
+                    "status": "run_failed",
+                    "diagnosis": {
+                        "classification": {
+                            "category": "missing_runtime_dependency",
+                            "evidence": [{"missing_module": "yaml"}]
+                        }
+                    }
+                }
+            }),
+        ];
+        let (action, note) = enforce_repro_action_guardrails(
+            requested,
+            Some("RUN_FAILED"),
+            Some("run_failed"),
+            &allowed,
+            &records,
+        );
+        assert_eq!(action, "classify_failure");
+        assert_eq!(
+            note.as_deref(),
+            Some("guardrail_classify_missing_runtime_dependency_after_env_selected")
+        );
+    }
+
+    #[test]
+    fn reroutes_classified_missing_runtime_dependency_directly_to_dependency_fix() {
+        let requested = "runtime_env_select".to_string();
+        let allowed = vec![
+            "runtime_python_select".to_string(),
+            "runtime_env_select".to_string(),
+            "dependency_runtime_fix".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let records = vec![
+            json!({
+                "action": "runtime_env_select",
+                "stdout": {"status": "success"}
+            }),
+            json!({
+                "action": "repro_run_once",
+                "stdout": {
+                    "status": "run_failed",
+                    "diagnosis": {
+                        "classification": {
+                            "category": "missing_runtime_dependency",
+                            "evidence": [{"missing_module": "yaml"}]
+                        }
+                    }
+                }
+            }),
+        ];
+        let (action, note) = enforce_repro_action_guardrails(
+            requested,
+            Some("CLASSIFY_FAILURE"),
+            Some("run_failed"),
+            &allowed,
+            &records,
+        );
+        assert_eq!(action, "dependency_runtime_fix");
+        assert_eq!(
+            note.as_deref(),
+            Some("guardrail_dependency_fix_missing_runtime_dependency_after_env_selected")
+        );
+    }
+
+    #[test]
+    fn routes_remote_qpu_surface_to_simulation_backend_fix() {
+        let requested = "runtime_trace_fix".to_string();
+        let allowed = vec![
+            "simulation_backend_fix".to_string(),
+            "runtime_trace_fix".to_string(),
+            "dependency_runtime_fix".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let records = vec![json!({
+            "action": "repro_run_once",
+            "stdout": {
+                "status": "run_failed",
+                "diagnosis": {
+                    "classification": {
+                        "category": "runtime_import_surface_mismatch",
+                        "evidence": [{"module": "qiskit_ibm_runtime.models"}]
+                    }
+                }
+            }
+        })];
+        let (action, note) = enforce_repro_action_guardrails(
+            requested,
+            Some("CLASSIFY_FAILURE"),
+            Some("run_failed"),
+            &allowed,
+            &records,
+        );
+        assert_eq!(action, "simulation_backend_fix");
+        assert_eq!(
+            note.as_deref(),
+            Some("guardrail_route_remote_qpu_surface_to_simulation_backend_fix")
+        );
+    }
+
+    #[test]
+    fn reroutes_python_select_to_dependency_fix_after_env_selected() {
+        let requested = "runtime_python_select".to_string();
+        let allowed = vec![
+            "runtime_python_select".to_string(),
+            "runtime_env_select".to_string(),
+            "dependency_runtime_fix".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let records = vec![
+            json!({
+                "action": "runtime_python_select",
+                "stdout": {"status": "success"}
+            }),
+            json!({
+                "action": "runtime_env_select",
+                "stdout": {"status": "success"}
+            }),
+        ];
+        let (action, note) = enforce_repro_action_guardrails(
+            requested,
+            Some("CLASSIFY_FAILURE"),
+            Some("runtime_env_selected"),
+            &allowed,
+            &records,
+        );
+        assert_eq!(action, "dependency_runtime_fix");
+        assert_eq!(
+            note.as_deref(),
+            Some("guardrail_dependency_fix_after_python_and_env_selected")
+        );
+    }
+
+    #[test]
+    fn native_planner_classifies_preflight_failure_before_runtime_selection() {
+        let allowed = vec![
+            "runtime_python_select".to_string(),
+            "runtime_env_select".to_string(),
+            "classify_failure".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let action = super::native_choose_action(
+            Some("PREFLIGHT_FAILED"),
+            Some("preflight_failed"),
+            None,
+            &allowed,
+        );
+        assert_eq!(action.as_deref(), Some("classify_failure"));
+    }
+
+    #[test]
+    fn native_planner_uses_dependency_fix_after_missing_dependency_classification() {
+        let allowed = vec![
+            "runtime_python_select".to_string(),
+            "runtime_env_select".to_string(),
+            "dependency_runtime_fix".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let action = super::native_choose_action(
+            Some("CLASSIFY_FAILURE"),
+            Some("preflight_failed"),
+            Some("missing_runtime_dependency"),
+            &allowed,
+        );
+        assert_eq!(action.as_deref(), Some("dependency_runtime_fix"));
+    }
+
+    #[test]
+    fn native_decision_is_preferred_for_deterministic_failure_transitions() {
+        let allowed = vec![
+            "runtime_python_select".to_string(),
+            "classify_failure".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        assert!(super::prefer_native_reproduce_decision(
+            Some("PREFLIGHT_FAILED"),
+            None,
+            &allowed,
+            &[],
+        ));
+
+        let classified_allowed = vec![
+            "dependency_runtime_fix".to_string(),
+            "runtime_env_select".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        assert!(super::prefer_native_reproduce_decision(
+            Some("CLASSIFY_FAILURE"),
+            Some("missing_runtime_dependency"),
+            &classified_allowed,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn probe_recommendations_prefer_runtime_env_before_dependency_install() {
+        let allowed = vec![
+            "repo_path_probe".to_string(),
+            "runtime_env_select".to_string(),
+            "dependency_runtime_fix".to_string(),
+            "simulation_backend_fix".to_string(),
+        ];
+        let recommended = vec![
+            "dependency_runtime_fix".to_string(),
+            "runtime_env_select".to_string(),
+            "simulation_backend_fix".to_string(),
+        ];
+        let action = super::choose_probe_recommended_action(&recommended, &allowed);
+        assert_eq!(action.as_deref(), Some("runtime_env_select"));
+    }
+
+    #[test]
+    fn fallback_uses_repo_path_probe_recommendations_after_probe_completed() {
+        let allowed = vec![
+            "repo_path_probe".to_string(),
+            "runtime_env_select".to_string(),
+            "dependency_runtime_fix".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let recommended = vec![
+            "dependency_runtime_fix".to_string(),
+            "runtime_env_select".to_string(),
+        ];
+        let selected = super::choose_fallback_action_with_runtime_python_priority(
+            Some("CLASSIFY_FAILURE"),
+            Some("repo_path_probe_completed"),
+            None,
+            &allowed,
+            &[],
+            &recommended,
+        );
+        assert_eq!(selected, "runtime_env_select");
+    }
+
+    #[test]
+    fn fallback_moves_past_runtime_env_after_probe_recommended_env_selected() {
+        let allowed = vec![
+            "repo_path_probe".to_string(),
+            "runtime_python_select".to_string(),
+            "runtime_env_select".to_string(),
+            "dependency_runtime_fix".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let recommended = vec![
+            "dependency_runtime_fix".to_string(),
+            "runtime_env_select".to_string(),
+        ];
+        let selected = super::choose_fallback_action_with_runtime_python_priority(
+            Some("CLASSIFY_FAILURE"),
+            Some("runtime_env_selected"),
+            None,
+            &allowed,
+            &[],
+            &recommended,
+        );
+        assert_eq!(selected, "dependency_runtime_fix");
+    }
+
+    #[test]
+    fn fallback_routes_original_code_path_failure_to_repo_probe() {
+        let allowed = vec![
+            "repo_path_probe".to_string(),
+            "runtime_python_select".to_string(),
+            "classify_failure".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let selected = super::choose_fallback_action_with_runtime_python_priority(
+            Some("RUN_FAILED"),
+            Some("run_failed"),
+            Some("original_code_path_not_exercised"),
+            &allowed,
+            &[],
+            &[],
+        );
+        assert_eq!(selected, "repo_path_probe");
+    }
+
+    #[test]
+    fn fallback_routes_probe_completed_original_code_path_failure_to_build_runner() {
+        let allowed = vec![
+            "repo_path_probe".to_string(),
+            "build_original_runner".to_string(),
+            "runtime_env_select".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let selected = super::choose_fallback_action_with_runtime_python_priority(
+            Some("CLASSIFY_FAILURE"),
+            Some("repo_path_probe_completed"),
+            Some("original_code_path_not_exercised"),
+            &allowed,
+            &[],
+            &[],
+        );
+        assert_eq!(selected, "build_original_runner");
+    }
+
+    #[test]
+    fn fallback_skips_failed_probe_recommended_action() {
+        let allowed = vec![
+            "simulation_backend_fix".to_string(),
+            "dependency_runtime_fix".to_string(),
+            "runtime_trace_fix".to_string(),
+            "terminal_failed".to_string(),
+        ];
+        let recommended = vec![
+            "dependency_runtime_fix".to_string(),
+            "simulation_backend_fix".to_string(),
+            "runtime_trace_fix".to_string(),
+        ];
+        let selected = super::choose_fallback_action_with_runtime_python_priority(
+            Some("CLASSIFY_FAILURE"),
+            Some("simulation_backend_fix_failed"),
+            Some("original_code_path_not_exercised"),
+            &allowed,
+            &[],
+            &recommended,
+        );
+        assert_eq!(selected, "dependency_runtime_fix");
+    }
+}
+
+fn extract_json_object_fragment(raw: &str) -> Result<Value, String> {
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        return Ok(value);
+    }
+    let start = raw
+        .find('{')
+        .ok_or_else(|| "missing '{' in model output".to_string())?;
+    let end = raw
+        .rfind('}')
+        .ok_or_else(|| "missing '}' in model output".to_string())?;
+    if end <= start {
+        return Err("invalid JSON object boundaries in model output".to_string());
+    }
+    serde_json::from_str::<Value>(&raw[start..=end])
+        .map_err(|error| format!("failed to parse model JSON fragment: {error}"))
+}
+
+fn choose_action_with_qwen(
+    rt: &tokio::runtime::Runtime,
+    client: &OpenAiCompatClient,
+    model: &str,
+    recipe_path: &Path,
+    step: usize,
+    fsm_state: Option<&str>,
+    last_status: Option<&str>,
+    allowed_actions: &[String],
+) -> Result<(String, String), String> {
+    let prompt = json!({
+        "step": step,
+        "recipe_path": recipe_path.display().to_string(),
+        "state": {
+            "fsm_state": fsm_state,
+            "last_status": last_status,
+        },
+        "allowed_actions": allowed_actions,
+        "instruction": "Select exactly one action from allowed_actions and return JSON: {\"action\":\"...\",\"reason\":\"...\"}. Prefer runtime_python_select first when runtime compatibility is uncertain; then prefer runtime_env_select to lock the run venv. Prefer constraint_resolve for version/API mismatches, env_fix for missing external dependencies, repo_path_probe when original repository execution paths need to be inspected, build_original_runner after repo_path_probe when proxy-only success was rejected, simulation_backend_fix when simulation_only reproduction hits IBM/QPU/token/qiskit_ibm_runtime surfaces, runtime_trace_fix for known traceback signatures (for example qiskit Store/ProviderV1 compatibility), source_path_fix for missing path-alias modules (for example src.*), dependency_runtime_fix for runtime missing third-party modules (for example mqt.*), and source_fix for missing in-repo modules/symbols. If the previous fix action returned *_skipped or *_failed, choose a different fix action instead of repeating the same one. After apply_fix, repo_path_probe, build_original_runner, simulation_backend_fix, runtime_trace_fix, source_path_fix, dependency_runtime_fix, source_fix, constraint_resolve, env_fix, or fix_validate, prefer repro_run_once to validate before rendering artifacts or stopping.",
+    });
+    let request = MessageRequest {
+        model: model.to_string(),
+        max_tokens: 200,
+        messages: vec![InputMessage::user_text(prompt.to_string())],
+        system: Some(
+            "You are a strict finite-state reproduce orchestrator. Output valid JSON only."
+                .to_string(),
+        ),
+        tools: None,
+        tool_choice: None,
+        stream: false,
+        temperature: Some(0.1),
+        top_p: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: None,
+        reasoning_effort: None,
+    };
+    let response = rt
+        .block_on(client.send_message(&request))
+        .map_err(|error| format!("openai-compatible call failed: {error}"))?;
+    let mut text_parts: Vec<String> = Vec::new();
+    for block in &response.content {
+        if let OutputContentBlock::Text { text } = block {
+            text_parts.push(text.clone());
+        }
+    }
+    let raw = text_parts.join("\n");
+    let parsed = extract_json_object_fragment(&raw)?;
+    let action = parsed
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let reason = parsed
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("model_no_reason")
+        .to_string();
+    if action.is_empty() {
+        return Err("model returned empty action".to_string());
+    }
+    Ok((action, reason))
+}
+
+fn run_native_reproduce_tool_loop(
+    cwd: &Path,
+    runner_args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let marker = resolve_reproduce_runner_from(
+        cwd,
+        Path::new("evaluation/agent_framework/reproduce/tools/tool_preflight.py"),
+    )
+    .ok_or_else(|| {
+        "reproduce tools not found. Expected evaluation/agent_framework/reproduce/tools/tool_preflight.py".to_string()
+    })?;
+    let reproduce_dir = marker
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| "invalid reproduce tools path layout".to_string())?;
+    let default_recipe = reproduce_dir.join("examples/qos_run_process_qernels_smoke.json");
+    if !default_recipe.is_file() {
+        return Err(format!(
+            "default recipe missing at {} ; pass --recipe <path> explicitly",
+            default_recipe.display()
+        )
+        .into());
+    }
+
+    let config = parse_native_reproduce_config(runner_args, &default_recipe)?;
+    let recipe_path = PathBuf::from(&config.recipe);
+    let recipe_path = if recipe_path.is_absolute() {
+        recipe_path
+    } else {
+        cwd.join(recipe_path)
+    };
+    if !recipe_path.is_file() {
+        return Err(format!("recipe not found: {}", recipe_path.display()).into());
+    }
+    let output_root = config
+        .output_root
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cwd.join("temp/agent_framework/reproduce_tool_loop/runs"));
+    let output_root = if output_root.is_absolute() {
+        output_root
+    } else {
+        cwd.join(output_root)
+    };
+    fs::create_dir_all(&output_root)?;
+    let state_path = if let Some(state) = config.state.as_ref() {
+        let parsed = PathBuf::from(state);
+        if parsed.is_absolute() {
+            parsed
+        } else {
+            cwd.join(parsed)
+        }
+    } else {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis();
+        output_root.join(format!("native_tool_loop_state_{stamp}.json"))
+    };
+
+    let mut allowed_actions = vec!["repro_preflight".to_string()];
+    let mut fsm_state: Option<String> = None;
+    let mut last_status: Option<String> = None;
+    let mut last_failure_category: Option<String> = None;
+    let mut render_outcome: Option<String> = None;
+    let mut step_records: Vec<Value> = Vec::new();
+    let mut probe_recommended_actions: Vec<String> = Vec::new();
+    let mut active_python_executable = config.python_executable.clone();
+    if state_path.is_file() {
+        if let Ok(raw_state) = fs::read_to_string(&state_path) {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&raw_state) {
+                if let Some(state) = parsed.get("fsm_state").and_then(Value::as_str) {
+                    fsm_state = Some(state.to_string());
+                }
+                if let Some(status) = parsed.get("last_status").and_then(Value::as_str) {
+                    last_status = Some(status.to_string());
+                }
+                if let Some(category) = parsed
+                    .get("last_classification")
+                    .and_then(|v| v.get("failure_category"))
+                    .or_else(|| {
+                        parsed
+                            .get("last_classification")
+                            .and_then(|v| v.get("category"))
+                    })
+                    .and_then(Value::as_str)
+                {
+                    last_failure_category = Some(category.to_string());
+                }
+                if let Some(outcome) = parsed.get("render_outcome").and_then(Value::as_str) {
+                    render_outcome = Some(outcome.to_string());
+                }
+                if active_python_executable.is_none() {
+                    active_python_executable = parsed
+                        .get("runtime_python_executable")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned);
+                }
+                if let Some(probe) = parsed.get("last_repo_path_probe") {
+                    probe_recommended_actions = probe_recommended_actions_from_value(probe);
+                }
+                allowed_actions = parsed
+                    .get("next_allowed_actions")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|values| !values.is_empty())
+                    .unwrap_or_else(|| reproduce_allowed_actions_for_state(fsm_state.as_deref()));
+            }
+        }
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    let qwen_client = OpenAiCompatClient::new(config.api_key.clone(), OpenAiCompatConfig::openai())
+        .with_base_url(config.api_base.clone())
+        .with_retry_policy(0, Duration::from_secs(1), Duration::from_secs(1));
+
+    println!(
+        "Reproduce\n  Runner           native-openclaw-tool-loop\n  Recipe           {}\n  State            {}\n  Max Steps        {}",
+        recipe_path.display(),
+        state_path.display(),
+        config.max_agent_steps
+    );
+
+    for step in 1..=config.max_agent_steps {
+        let fallback_action = choose_fallback_action_with_runtime_python_priority(
+            fsm_state.as_deref(),
+            last_status.as_deref(),
+            last_failure_category.as_deref(),
+            &allowed_actions,
+            &step_records,
+            &probe_recommended_actions,
+        );
+        let (selected_action, mut decision_source, mut decision_reason) =
+            if prefer_native_reproduce_decision(
+                fsm_state.as_deref(),
+                last_failure_category.as_deref(),
+                &allowed_actions,
+                &probe_recommended_actions,
+            ) {
+                (
+                    fallback_action.clone(),
+                    "native_planner".to_string(),
+                    "deterministic reproduce transition".to_string(),
+                )
+            } else {
+                let first_decision = choose_action_with_qwen(
+                    &rt,
+                    &qwen_client,
+                    &config.model,
+                    &recipe_path,
+                    step,
+                    fsm_state.as_deref(),
+                    last_status.as_deref(),
+                    &allowed_actions,
+                );
+                match first_decision {
+                    Ok((model_action, reason))
+                        if allowed_actions.iter().any(|a| a == &model_action) =>
+                    {
+                        (model_action, "qwen".to_string(), reason)
+                    }
+                    Ok((first_action, first_reason)) => {
+                        let second_decision = choose_action_with_qwen(
+                            &rt,
+                            &qwen_client,
+                            &config.model,
+                            &recipe_path,
+                            step,
+                            fsm_state.as_deref(),
+                            last_status.as_deref(),
+                            &allowed_actions,
+                        );
+                        match second_decision {
+                        Ok((second_action, second_reason))
+                            if allowed_actions.iter().any(|a| a == &second_action) =>
+                        {
+                            (
+                                second_action,
+                                "qwen_reask".to_string(),
+                                format!(
+                                    "reask_after_invalid_action first_action={first_action}; first_reason={first_reason}; second_reason={second_reason}"
+                                ),
+                            )
+                        }
+                        Ok((second_action, second_reason)) => (
+                            fallback_action.clone(),
+                            "fallback".to_string(),
+                            format!(
+                                "model_invalid_action_twice first_action={first_action}; first_reason={first_reason}; second_action={second_action}; second_reason={second_reason}"
+                            ),
+                        ),
+                        Err(error) => (
+                            fallback_action.clone(),
+                            "fallback".to_string(),
+                            format!(
+                                "model_invalid_then_reask_error first_action={first_action}; first_reason={first_reason}; error={error}"
+                            ),
+                        ),
+                    }
+                    }
+                    Err(error) => {
+                        if !config.allow_offline_agent {
+                            return Err(format!(
+                            "qwen decision call failed and --allow-offline-agent not set: {error}"
+                        )
+                            .into());
+                        }
+                        (
+                            fallback_action,
+                            "fallback".to_string(),
+                            format!("model_error_fallback: {error}"),
+                        )
+                    }
+                }
+            };
+        let (action, guardrail_note) = enforce_repro_action_guardrails(
+            selected_action,
+            fsm_state.as_deref(),
+            last_status.as_deref(),
+            &allowed_actions,
+            &step_records,
+        );
+        if let Some(note) = guardrail_note {
+            decision_source = format!("{decision_source}+guardrail");
+            decision_reason = format!("{decision_reason}; {note}");
+        }
+        let is_terminal = matches!(
+            action.as_str(),
+            "done" | "stop" | "success" | "terminal_failed" | "escalate_human_review"
+        );
+        if is_terminal {
+            step_records.push(json!({
+                "step": step,
+                "decision": action,
+                "decision_source": decision_source,
+                "decision_reason": decision_reason,
+                "allowed_actions": allowed_actions,
+                "terminal": true,
+            }));
+            break;
+        }
+        let Some(tool_name) = action_to_repro_tool(&action) else {
+            return Err(format!("no tool mapping for action: {action}").into());
+        };
+
+        let mut input = serde_json::Map::new();
+        input.insert("state".to_string(), json!(state_path.display().to_string()));
+        if !matches!(
+            action.as_str(),
+            "run_unit_tests" | "run_regression_tests" | "render_artifacts"
+        ) {
+            input.insert(
+                "recipe".to_string(),
+                json!(recipe_path.display().to_string()),
+            );
+        }
+        if matches!(
+            action.as_str(),
+            "repro_preflight" | "repro_run_once" | "verify_claim"
+        ) {
+            input.insert(
+                "output_root".to_string(),
+                json!(output_root.display().to_string()),
+            );
+        }
+        if let Some(python_executable) = active_python_executable.as_ref() {
+            if matches!(
+                action.as_str(),
+                "runtime_python_select"
+                    | "runtime_env_select"
+                    | "repro_preflight"
+                    | "repro_run_once"
+                    | "env_fix"
+                    | "apply_fix"
+                    | "repo_path_probe"
+                    | "build_original_runner"
+                    | "simulation_backend_fix"
+                    | "runtime_trace_fix"
+                    | "source_path_fix"
+                    | "dependency_runtime_fix"
+            ) {
+                input.insert("python_executable".to_string(), json!(python_executable));
+            }
+        }
+
+        let raw = execute_tool(tool_name, &Value::Object(input))
+            .map_err(|error| format!("{tool_name} failed to execute: {error}"))?;
+        let payload: Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("{tool_name} returned invalid JSON payload: {error}"))?;
+        let stdout = payload.get("stdout").cloned().unwrap_or_else(|| json!({}));
+        if let Some(state) = stdout.get("fsm_state").and_then(Value::as_str) {
+            fsm_state = Some(state.to_string());
+        }
+        if let Some(status) = stdout.get("status").and_then(Value::as_str) {
+            last_status = Some(normalize_repro_status_for_action(&action, status));
+        }
+        if let Some(category) = stdout.get("failure_category").and_then(Value::as_str) {
+            last_failure_category = Some(category.to_string());
+        } else if let Some(category) = stdout
+            .get("diagnosis")
+            .and_then(|v| v.get("classification"))
+            .and_then(|v| v.get("category"))
+            .and_then(Value::as_str)
+        {
+            last_failure_category = Some(category.to_string());
+        }
+        if let Some(runtime_python) = stdout
+            .get("python_executable")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            active_python_executable = Some(runtime_python.to_string());
+        }
+        if let Some(outcome) = stdout.get("render_outcome").and_then(Value::as_str) {
+            render_outcome = Some(outcome.to_string());
+        }
+        if action == "repo_path_probe" {
+            probe_recommended_actions = probe_recommended_actions_from_value(&stdout);
+        }
+        allowed_actions = stdout
+            .get("next_allowed_actions")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty())
+            .unwrap_or_else(|| vec!["terminal_failed".to_string()]);
+
+        step_records.push(json!({
+            "step": step,
+            "action": action,
+            "decision_source": decision_source,
+            "decision_reason": decision_reason,
+            "tool": tool_name,
+            "command_success": payload.get("command_success").and_then(Value::as_bool).unwrap_or(false),
+            "stdout": stdout,
+            "allowed_actions_after": allowed_actions,
+            "active_python_executable": active_python_executable,
+        }));
+    }
+
+    if state_path.is_file() {
+        if let Ok(raw_state) = fs::read_to_string(&state_path) {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&raw_state) {
+                if let Some(state) = parsed.get("fsm_state").and_then(Value::as_str) {
+                    fsm_state = Some(state.to_string());
+                }
+                if let Some(status) = parsed.get("last_status").and_then(Value::as_str) {
+                    last_status = Some(status.to_string());
+                }
+                if let Some(category) = parsed
+                    .get("last_classification")
+                    .and_then(|v| v.get("failure_category"))
+                    .or_else(|| {
+                        parsed
+                            .get("last_classification")
+                            .and_then(|v| v.get("category"))
+                    })
+                    .and_then(Value::as_str)
+                {
+                    last_failure_category = Some(category.to_string());
+                }
+                if let Some(outcome) = parsed.get("render_outcome").and_then(Value::as_str) {
+                    render_outcome = Some(outcome.to_string());
+                }
+            }
+        }
+    }
+
+    let has_successful_run_once = step_records.iter().any(|record| {
+        record.get("action").and_then(Value::as_str) == Some("repro_run_once")
+            && record
+                .get("command_success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && record
+                .get("stdout")
+                .and_then(|stdout| stdout.get("status"))
+                .and_then(Value::as_str)
+                == Some("success")
+    });
+    let verify_skipped_but_run_succeeded = matches!(fsm_state.as_deref(), Some("VERIFY_CLAIM"))
+        && matches!(
+            last_status.as_deref(),
+            Some("skipped" | "verification_skipped")
+        )
+        && has_successful_run_once;
+
+    let strict_success = if matches!(fsm_state.as_deref(), Some("SUCCESS")) {
+        matches!(
+            last_status.as_deref(),
+            Some("success" | "verification_success")
+        )
+    } else if matches!(fsm_state.as_deref(), Some("ARTIFACTS_RENDERED")) {
+        matches!(render_outcome.as_deref(), Some("success"))
+    } else if verify_skipped_but_run_succeeded {
+        true
+    } else {
+        false
+    };
+    let summary = json!({
+        "runner": "native-openclaw-tool-loop",
+        "status": if strict_success { "success" } else { "failed" },
+        "strict_success": strict_success,
+        "exit_policy": config.exit_policy,
+        "final_fsm_state": fsm_state,
+        "final_status": last_status,
+        "final_failure_category": last_failure_category,
+        "render_outcome": render_outcome,
+        "recipe": recipe_path.display().to_string(),
+        "model": config.model,
+        "api_base": config.api_base,
+        "state_path": state_path.display().to_string(),
+        "steps": step_records.len(),
+        "records": step_records,
+    });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    if config.exit_policy == "lenient" || strict_success {
+        println!("Reproduce\n  Result           success");
+        return Ok(());
+    }
+    Err("reproduce native tool loop did not reach strict success".into())
+}
+
+fn run_reproduce_command(args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let mut runner_args = split_reproduce_args(args);
+    runner_args.retain(|arg| arg != "--tool-loop");
+    run_native_reproduce_tool_loop(&cwd, &runner_args)
+}
+
 fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -2913,6 +5212,7 @@ fn run_resume_command(
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
         | SlashCommand::Review { .. }
+        | SlashCommand::Reproduce { .. }
         | SlashCommand::Tasks { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
@@ -3863,6 +6163,10 @@ impl LiveCli {
                 self.run_issue(context.as_deref())?;
                 false
             }
+            SlashCommand::Reproduce { args } => {
+                self.run_reproduce(args.as_deref())?;
+                false
+            }
             SlashCommand::Ultraplan { task } => {
                 self.run_ultraplan(task.as_deref())?;
                 false
@@ -4650,6 +6954,10 @@ impl LiveCli {
     fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", format_issue_report(context));
         Ok(())
+    }
+
+    fn run_reproduce(&self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        run_reproduce_command(args)
     }
 }
 
@@ -8161,6 +10469,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw reproduce [runner-args]")?;
+    writeln!(
+        out,
+        "      Run reproduce using the native tool-loop state-machine runner"
+    )?;
     writeln!(
         out,
         "  claw export [PATH] [--session SESSION] [--output PATH]"
@@ -8271,14 +10584,14 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        choose_fallback_action_with_runtime_python_priority, collect_session_prompt_history,
+        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
+        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
+        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
@@ -9176,6 +11489,21 @@ mod tests {
             parse_args(&["init".to_string()]).expect("init should parse"),
             CliAction::Init {
                 output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["reproduce".to_string()]).expect("reproduce should parse"),
+            CliAction::Reproduce { args: None }
+        );
+        assert_eq!(
+            parse_args(&[
+                "reproduce".to_string(),
+                "--max-agent-steps".to_string(),
+                "2".to_string()
+            ])
+            .expect("reproduce with args should parse"),
+            CliAction::Reproduce {
+                args: Some("--max-agent-steps 2".to_string())
             }
         );
         assert_eq!(
@@ -11502,6 +13830,46 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+    }
+
+    #[test]
+    fn fallback_prioritizes_runtime_python_select_before_first_success() {
+        let allowed_actions = vec![
+            "runtime_python_select".to_string(),
+            "runtime_env_select".to_string(),
+            "constraint_resolve".to_string(),
+        ];
+        let selected = choose_fallback_action_with_runtime_python_priority(
+            Some("PREFLIGHT_FAILED"),
+            Some("preflight_failed"),
+            None,
+            &allowed_actions,
+            &[],
+            &[],
+        );
+        assert_eq!(selected, "runtime_python_select");
+    }
+
+    #[test]
+    fn fallback_does_not_force_runtime_python_select_after_successful_selection() {
+        let allowed_actions = vec![
+            "runtime_python_select".to_string(),
+            "runtime_env_select".to_string(),
+            "dependency_runtime_fix".to_string(),
+        ];
+        let step_records = vec![json!({
+            "action": "runtime_python_select",
+            "stdout": {"status": "success"}
+        })];
+        let selected = choose_fallback_action_with_runtime_python_priority(
+            Some("CLASSIFY_FAILURE"),
+            Some("runtime_python_selected"),
+            Some("missing_runtime_dependency"),
+            &allowed_actions,
+            &step_records,
+            &[],
+        );
+        assert_eq!(selected, "runtime_env_select");
     }
 }
 

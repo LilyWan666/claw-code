@@ -286,6 +286,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "reproduce",
+        aliases: &[],
+        summary: "Run reproduce agent pipeline from the current workspace",
+        argument_hint: Some("[runner-args]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "tasks",
         aliases: &[],
         summary: "List and manage background tasks",
@@ -1142,6 +1149,9 @@ pub enum SlashCommand {
     Review {
         scope: Option<String>,
     },
+    Reproduce {
+        args: Option<String>,
+    },
     Tasks {
         args: Option<String>,
     },
@@ -1410,6 +1420,7 @@ pub fn validate_slash_command_input(
         }
         "plan" => SlashCommand::Plan { mode: remainder },
         "review" => SlashCommand::Review { scope: remainder },
+        "reproduce" => SlashCommand::Reproduce { args: remainder },
         "tasks" => SlashCommand::Tasks { args: remainder },
         "theme" => SlashCommand::Theme { name: remainder },
         "voice" => SlashCommand::Voice { mode: remainder },
@@ -1791,6 +1802,26 @@ fn slash_command_detail_lines(spec: &SlashCommandSpec) -> Vec<String> {
     }
     if spec.resume_supported {
         lines.push("  Resume           Supported with --resume SESSION.jsonl".to_string());
+    }
+    if spec.name == "reproduce" {
+        lines.push("  Behavior         Defaults to --exit-policy strict when omitted".to_string());
+        lines.push(
+            "  Behavior         Pass --tool-loop to use tool-first FSM orchestration runner"
+                .to_string(),
+        );
+        lines.push("  Example          /reproduce".to_string());
+        lines.push(
+            "  Example          /reproduce --recipe path/to/recipe.json --max-agent-steps 4"
+                .to_string(),
+        );
+        lines.push(
+            "  Example          /reproduce --tool-loop --recipe path/to/recipe.json"
+                .to_string(),
+        );
+        lines.push(
+            "  Example          /reproduce --recipe path/to/recipe.json --api-base http://localhost:8000/v1 --model Qwen2.5-14B-Instruct"
+                .to_string(),
+        );
     }
     lines
 }
@@ -3991,6 +4022,7 @@ pub fn handle_slash_command(
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
         | SlashCommand::Review { .. }
+        | SlashCommand::Reproduce { .. }
         | SlashCommand::Tasks { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
@@ -4320,6 +4352,12 @@ mod tests {
                 target: Some("incident-review".to_string())
             }))
         );
+        assert_eq!(
+            SlashCommand::parse("/reproduce --max-agent-steps 2"),
+            Ok(Some(SlashCommand::Reproduce {
+                args: Some("--max-agent-steps 2".to_string())
+            }))
+        );
     }
 
     #[test]
@@ -4587,6 +4625,16 @@ mod tests {
         assert!(help.contains("Summary          Inspect configured MCP servers"));
         assert!(help.contains("Category         Tools"));
         assert!(help.contains("Resume           Supported with --resume SESSION.jsonl"));
+    }
+
+    #[test]
+    fn renders_per_command_help_detail_for_reproduce() {
+        let help = render_slash_command_help_detail("reproduce").expect("detail help should exist");
+        assert!(help.contains("/reproduce"));
+        assert!(help.contains("Summary          Run reproduce agent pipeline from the current workspace"));
+        assert!(help.contains("Behavior         Defaults to --exit-policy strict when omitted"));
+        assert!(help.contains("Example          /reproduce"));
+        assert!(help.contains("--recipe path/to/recipe.json"));
     }
 
     #[test]
